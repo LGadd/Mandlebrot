@@ -1,1 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mandelbrot — silky GPU zoom + trippy colors</title>
+  <style>
+    html, body { height: 100%; margin: 0; background:#070707; color:#ddd; font:12px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    main { height:100%; display:grid; place-items:center; }
+    #hud { position:fixed; left:12px; bottom:12px; background:rgba(0,0,0,.45); padding:.5rem .75rem; border-radius:.6rem; backdrop-filter: blur(6px); box-shadow:0 8px 20px rgba(0,0,0,.25); }
+    #hud kbd { background:#111; padding:.1rem .35rem; border-radius:.35rem; box-shadow: inset 0 0 0 1px rgba(255,255,255,.06); }
+  </style>
+</head>
+<body>
+  <main></main>
+  <div id="hud">
+    <div>GPU Mandelbrot — smooth zoom + palette tied to escape-time & argument</div>
+    <div><kbd>SPACE</kbd> pause • <kbd>R</kbd> reset • <kbd>↑/↓</kbd> zoom speed • <kbd>A/D</kbd> pan X • <kbd>W/S</kbd> pan Y • <kbd>C</kbd> cycle palettes</div>
+  </div>
+
+  <!-- p5.js -->
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.9.2/lib/p5.min.js"></script>
+  <script>
+    // Vertex and fragment shaders as JS template strings
+    const vert = `
+      precision mediump float;
+      attribute vec3 aPosition;
+      void main(){
+        gl_Position = vec4(aPosition, 1.0);
+      }
+    `;
+
+    const frag = `
+      precision highp float;
+      uniform vec2 u_resolution;   // canvas size
+      uniform float u_time;        // seconds
+      uniform vec2 u_center;       // center in complex plane
+      uniform float u_scale;       // half-width of viewport in complex plane
+      uniform int u_iter;          // max iterations
+      uniform int u_palette;       // palette selector
+
+      // Cosine palette helper (Inigo Quilez style)
+      vec3 cosinePalette(float t, vec3 a, vec3 b, vec3 c, vec3 d) {
+        return a + b * cos(6.28318 * (c * t + d));
+      }
+
+      void main(){
+        // Normalized pixel coords (0..1)
+        vec2 uv = gl_FragCoord.xy / u_resolution.xy;
+        float aspect = u_resolution.x / u_resolution.y;
+
+        // Map to complex plane. Keep aspect so pixels are square in math-space.
+        float halfW = u_scale;
+        float halfH = u_scale / aspect;
+        float a0 = u_center.x + mix(-halfW, halfW, uv.x);
+        float b0 = u_center.y + mix(-halfH, halfH, uv.y);
+
+        // Iterate Mandelbrot
+        float a = a0;
+        float b = b0;
+        int n = 0;
+        float aa, bb;
+        float mag2 = 0.0;
+        for(int i=0; i<2000; i++){
+          if(i >= u_iter) break;
+          aa = a*a - b*b + a0;
+          bb = 2.0*a*b + b0;
+          a = aa; b = bb;
+          mag2 = a*a + b*b;
+          if(mag2 > 4.0){ n = i; break; }
+          n = i;
+        }
+
+        float t;
+        if(mag2 <= 4.0){
+          // Inside set — very dark, but not pure black to reveal filaments
+          gl_FragColor = vec4(vec3(0.02), 1.0);
+          return;
+        } else {
+          // Smooth iteration count (continuous coloring)
+          float nu = log(log(sqrt(mag2)) / log(2.0)) / log(2.0);
+          float smooth = float(n) + 1.0 - nu;  // continuous index
+          t = smooth / float(u_iter);
+        }
+
+        // Use the argument (angle) of z to modulate colors in a swirly/trippy way
+        float angle = atan(b, a); // -pi..pi
+        float argMod = 0.5 + 0.5 * sin(3.0 * angle + 0.7 * sin(u_time));
+
+        // Palette families — driven mostly by t (escape time), with a little angle/time spice
+        vec3 col;
+        if(u_palette == 0){
+          // Neon twilight
+          col = cosinePalette(t + 0.10*argMod,
+                              vec3(0.2),
+                              vec3(0.8),
+                              vec3(1.0, 0.5, 0.25),
+                              vec3(0.00, 0.33, 0.67) + 0.05*sin(u_time));
+        } else if(u_palette == 1){
+          // Psychedelic rainbows
+          col = cosinePalette(t*1.2 + 0.15*argMod + 0.05*sin(u_time*0.8),
+                              vec3(0.5),
+                              vec3(0.5),
+                              vec3(1.0, 1.0, 1.0),
+                              vec3(0.0, 0.33, 0.67));
+        } else if(u_palette == 2){
+          // Deep ocean fire
+          col = cosinePalette(t*0.9 - 0.1*argMod,
+                              vec3(0.05, 0.06, 0.10),
+                              vec3(0.95, 0.6, 0.4),
+                              vec3(0.9, 0.6, 0.3),
+                              vec3(0.0, 0.20, 0.45) + 0.03*cos(u_time));
+        } else {
+          // Pastel dream
+          col = cosinePalette(t + 0.07*sin(argMod*6.28318),
+                              vec3(0.6),
+                              vec3(0.4),
+                              vec3(1.0, 0.7, 0.4),
+                              vec3(0.0, 0.25, 0.5));
+        }
+
+        // Slight contrast curve
+        col = pow(col, vec3(1.1));
+
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `;
+
+    let theShader;
+    let centerX = -0.5, centerY = 0.0;
+    let zoom = 1.0;              // grows over time
+    let zoomSpeed = 1.0125;      // smoother default speed than CPU version
+    let paused = false;
+    let palette = 0;
+
+    function setup(){
+      const size = Math.min(window.innerWidth, window.innerHeight);
+      createCanvas(size, size, WEBGL);
+      pixelDensity(1); // shader renders at device res anyway
+      theShader = createShader(vert, frag);
+      noStroke();
+    }
+
+    function windowResized(){
+      const size = Math.min(window.innerWidth, window.innerHeight);
+      resizeCanvas(size, size);
+    }
+
+    function draw(){
+      if (!paused) zoom *= zoomSpeed;
+
+      shader(theShader);
+      theShader.setUniform('u_resolution', [width, height]);
+      theShader.setUniform('u_time', millis()/1000);
+
+      // Convert zoom to plane half-width scale (start ~2.5 like classic view)
+      const scale = 2.5 / zoom;
+      theShader.setUniform('u_center', [centerX, centerY]);
+      theShader.setUniform('u_scale', scale);
+
+      // Increase iterations gently with zoom for detail without stutter
+      const maxIterations = Math.floor(80 + Math.log(zoom + 1) * 120.0);
+      theShader.setUniform('u_iter', maxIterations);
+      theShader.setUniform('u_palette', palette);
+
+      rect(-width/2, -height/2, width, height); // full-screen quad
+    }
+
+    function keyPressed(){
+      if (key === ' ') paused = !paused;
+      if (key === 'R' || key === 'r') { centerX=-0.5; centerY=0.0; zoom=1.0; zoomSpeed=1.0125; paused=false; }
+      if (keyCode === UP_ARROW)   zoomSpeed *= 1.02;
+      if (keyCode === DOWN_ARROW) zoomSpeed /= 1.02;
+      if (key === 'A' || key === 'a') centerX -= (2.5/zoom) * 0.15;
+      if (key === 'D' || key === 'd') centerX += (2.5/zoom) * 0.15;
+      if (key === 'W' || key === 'w') centerY -= (2.5/zoom) * 0.15;
+      if (key === 'S' || key === 's') centerY += (2.5/zoom) * 0.15;
+      if (key === 'C' || key === 'c') palette = (palette + 1) % 4;
+    }
+  </script>
+</body>
+</html>
 
